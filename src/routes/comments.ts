@@ -2,12 +2,14 @@ import { Router, Response } from 'express';
 import { ForumPost } from '../models/ForumPost';
 import { ForumComment } from '../models/ForumComment';
 import { ForumNotification } from '../models/ForumNotification';
-import { requireAuth, AuthedRequest } from '../middleware/auth';
+import { requireAuth, AuthedRequest, ADMIN_PHONE } from '../middleware/auth';
 import { extractMentions } from '../lib/mentions';
-import { notifyMention } from '../lib/notify';
+import { notifyMention, notifyOfficialMention } from '../lib/notify';
+import { OFFICIAL_HANDLE, containsOfficialMention } from '../lib/officialHandle';
 import { containsPhoneNumber, stripPhoneNumbers } from '../lib/phoneGuard';
 import { containsLink, stripLinks } from '../lib/linkGuard';
 import { ForumViolation } from '../models/ForumViolation';
+import { RAUser } from '../models/RAUser';
 import { sequelize } from '../config/database';
 
 const router = Router({ mergeParams: true });
@@ -123,9 +125,17 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
     const explicitIds = Array.isArray(req.body.mentioned_user_ids)
       ? req.body.mentioned_user_ids.map((id: any) => String(id)).slice(0, 10)
       : [];
-    const mentionedIds = Array.from(new Set([...extractMentions(comment.body), ...explicitIds]))
+    const rawMentionedIds = Array.from(new Set([...extractMentions(comment.body), ...explicitIds]))
       .filter((id) => id !== req.identity!.id)
       .slice(0, 10);
+    // @Tglevels is a reserved official handle (id can never equal a numeric
+    // user id). Detect it case-insensitively from the id list AND the body
+    // text (covers bypassing clients), then notify the admin RA instead of an
+    // end user — the official account has no user row to notify.
+    const officialMentioned =
+      rawMentionedIds.some((id) => id.toLowerCase() === OFFICIAL_HANDLE.id) ||
+      containsOfficialMention(comment.body);
+    const mentionedIds = rawMentionedIds.filter((id) => id.toLowerCase() !== OFFICIAL_HANDLE.id);
     for (const mentionedUserId of mentionedIds) {
       await ForumNotification.create({
         user_id: mentionedUserId,
@@ -145,8 +155,37 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
         mentionedUserId,
         postId,
         commentId: comment.id,
+        commentBody: comment.body,
         actorName: comment.author_name || undefined,
       });
+    }
+    if (officialMentioned) {
+      const adminRa = await RAUser.findOne({ where: { phone_number: ADMIN_PHONE, status: 'active' } });
+      if (adminRa) {
+        await ForumNotification.create({
+          user_id: adminRa.ra_id,
+          user_type: 'ra',
+          type: 'mention',
+          source_type: 'comment',
+          source_id: comment.id,
+          actor_id: req.identity!.id,
+        });
+        io.to(`user:${adminRa.ra_id}`).emit('notification:new', {
+          type: 'mention',
+          mention: 'official',
+          post_id: postId,
+          comment_id: comment.id,
+          actor_name: comment.author_name,
+        });
+        notifyOfficialMention({
+          adminRaId: adminRa.ra_id,
+          postId,
+          commentId: comment.id,
+          actorName: comment.author_name || undefined,
+        });
+      } else {
+        console.warn('[comments] @Tglevels mentioned but no active admin RA found to notify');
+      }
     }
 
     const payload: any = { success: true, data: serialized };

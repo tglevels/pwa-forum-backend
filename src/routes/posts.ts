@@ -79,11 +79,45 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
   }
 });
 
+// Trending candidates are drawn from this window so the ranking stays about
+// "what's hot lately", not "best post of all time" (which decay alone would
+// eventually surface again as older top posts' scores decay toward zero
+// anyway, but restricting the pool keeps the query cheap as the table grows).
+const TRENDING_WINDOW_DAYS = 14;
+
+// Reddit/HN-style decayed engagement score: comments weigh most (strongest
+// engagement signal), views least (cheapest, easiest to rack up passively).
+// The (age + 2)^1.5 denominator lets a post decay out of trending within a
+// couple of days even if it never stops accumulating views.
+function trendingScore(post: ForumPost): number {
+  const ageHours = (Date.now() - new Date(post.createdAt).getTime()) / 3600000;
+  const engagement = post.vote_count * 2 + post.comment_count * 3 + post.view_count * 0.5;
+  return engagement / Math.pow(Math.max(ageHours, 0) + 2, 1.5);
+}
+
 // GET /posts — feed. Public (per §1, reads don't require the user JWT).
-// Supports ?since=<ISO timestamp> for reconnect reconciliation.
+// Supports ?since=<ISO timestamp> for reconnect reconciliation, and
+// ?sort=trending for the decayed-engagement ranking instead of chronological
+// (trending ignores since/cursor — it's always a fresh top-N, not a page).
 router.get('/', async (req: AuthedRequest, res: Response) => {
   try {
-    const { since, cursor, limit } = req.query;
+    const { since, cursor, limit, sort } = req.query;
+    const capped = Math.min(Number(limit) || 20, 50);
+
+    if (sort === 'trending') {
+      const windowStart = new Date(Date.now() - TRENDING_WINDOW_DAYS * 86400000);
+      const candidates = await ForumPost.findAll({
+        where: { status: 'published', createdAt: { [Op.gte]: windowStart } },
+        order: [['id', 'DESC']],
+        limit: 300,
+      });
+      const ranked = candidates
+        .slice()
+        .sort((a, b) => trendingScore(b) - trendingScore(a))
+        .slice(0, capped);
+      return res.json({ success: true, data: await serializePosts(ranked) });
+    }
+
     const where: any = { status: 'published' };
     if (since) {
       where.createdAt = { [Op.gt]: new Date(String(since)) };
@@ -94,7 +128,7 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
     const posts = await ForumPost.findAll({
       where,
       order: [['id', 'DESC']],
-      limit: Math.min(Number(limit) || 20, 50),
+      limit: capped,
     });
 
     return res.json({ success: true, data: await serializePosts(posts) });

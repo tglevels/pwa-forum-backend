@@ -57,7 +57,7 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
     }
 
     const file = req.file;
-    const media_url = file ? `/uploads/${file.filename}` : null;
+    const media_url = file ? `/upload/${file.filename}` : null;
     const media_type = file ? (file.mimetype.startsWith('video') ? 'video' : 'image') : null;
 
     const post = await ForumPost.create({
@@ -259,7 +259,7 @@ router.patch('/:id', requireAuth, requireAdmin, upload.single('media'), async (r
 
     const file = req.file;
     if (file) {
-      updates.media_url = `/uploads/${file.filename}`;
+      updates.media_url = `/upload/${file.filename}`;
       updates.media_type = file.mimetype.startsWith('video') ? 'video' : 'image';
     }
 

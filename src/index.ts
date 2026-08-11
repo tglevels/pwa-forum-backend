@@ -1,3 +1,4 @@
+import fs from 'fs';
 import express from 'express';
 import http from 'http';
 import jwt from 'jsonwebtoken';
@@ -85,9 +86,15 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.set('io', io);
 
-// Post media (images/video), served at /uploads/<file> — same static-serve
-// pattern as pwa-node-backend's chat attachments.
-app.use('/uploads', express.static('uploads', { maxAge: '30d', immutable: true }));
+// Post media (images/video), served at /upload/<file> from the forum service's
+// own 'upload' folder (singular — distinct from pwa-node-backend's '/uploads'
+// chat attachments). Same static-serve pattern otherwise.
+app.use('/upload', express.static('upload', { maxAge: '30d', immutable: true }));
+
+// multer's diskStorage doesn't create its destination directory — make sure the
+// 'upload' folder exists on boot (cwd-relative, matching the multer/static
+// paths) so the first media upload doesn't crash with ENOENT.
+fs.mkdirSync('upload', { recursive: true });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key-for-local-dev';
 const FORUM_JWT_SECRET = process.env.FORUM_JWT_SECRET || 'fallback-forum-user-secret';

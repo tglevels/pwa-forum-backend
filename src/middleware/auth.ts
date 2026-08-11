@@ -51,16 +51,21 @@ export function requireAuth(req: AuthedRequest, res: Response, next: NextFunctio
   return res.status(401).json({ success: false, message: 'Invalid or expired token' });
 }
 
+// Shared admin check (DB-backed, not token-trusted) reused by requireAdmin
+// and by routes that need to branch on admin-vs-owner without a hard 403,
+// e.g. "admin OR the comment's own author may delete it".
+export async function isAdminIdentity(identity?: ForumIdentity): Promise<boolean> {
+  if (identity?.type !== 'ra') return false;
+  const ra = await RAUser.findByPk(identity.id);
+  return !!ra && ra.status === 'active' && String(ra.phone_number).trim() === ADMIN_PHONE;
+}
+
 // Admin = the RA whose phone_number matches RA_ADMIN_PHONE, checked against the
 // DB (not the token) — mirrors pwa-node-backend's requireAdmin exactly, since
 // this service can't reuse that middleware in-process.
 export async function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction) {
   try {
-    if (req.identity?.type !== 'ra') {
-      return res.status(403).json({ success: false, message: 'Only the admin RA can perform this action' });
-    }
-    const ra = await RAUser.findByPk(req.identity.id);
-    if (!ra || ra.status !== 'active' || String(ra.phone_number).trim() !== ADMIN_PHONE) {
+    if (!(await isAdminIdentity(req.identity))) {
       return res.status(403).json({ success: false, message: 'Only the admin RA can perform this action' });
     }
     return next();

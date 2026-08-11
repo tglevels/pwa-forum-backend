@@ -14,9 +14,24 @@ import { ForumPostView } from './models/ForumPostView';
 import { ForumNotification } from './models/ForumNotification';
 import { ForumViolation } from './models/ForumViolation';
 
-// forum_posts predates the media/view_count columns — sync() only creates
-// missing tables, so add these by hand the first time they're absent.
-// Additive-only, never touches existing rows/columns.
+// forum_comments predates the is_pinned column — sync() only creates missing
+// tables, so add it by hand the first time it's absent. Additive-only, never
+// touches existing rows/columns.
+async function ensureForumCommentPinnedColumn() {
+  const qi = sequelize.getQueryInterface();
+  const columns = await qi.describeTable('forum_comments');
+  if (!columns.is_pinned) {
+    await qi.addColumn('forum_comments', 'is_pinned', {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    });
+  }
+}
+
+// forum_posts predates the media/pin columns — sync() only creates missing
+// tables, so add these by hand the first time they're absent. Additive-only,
+// never touches existing rows/columns.
 async function ensureForumPostMediaColumns() {
   const qi = sequelize.getQueryInterface();
   const columns = await qi.describeTable('forum_posts');
@@ -44,6 +59,13 @@ async function ensureViolationTypeEnum() {
     type: DataTypes.ENUM('phone_number', 'link'),
     allowNull: false,
   });
+  if (!columns.is_pinned) {
+    await qi.addColumn('forum_posts', 'is_pinned', {
+      type: DataTypes.BOOLEAN,
+      allowNull: false,
+      defaultValue: false,
+    });
+  }
 }
 
 const app = express();
@@ -54,7 +76,7 @@ const corsOptions = {
     callback(null, true);
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PATCH', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
 };
 
 const io = new Server(server, { cors: corsOptions });
@@ -143,6 +165,8 @@ async function startServer() {
     // After ForumComment (it has an FK reference to forum_comments).
     await ForumViolation.sync();
     await ensureViolationTypeEnum();
+    
+    await ensureForumCommentPinnedColumn();
 
     server.listen(PORT, () => {
       console.log(`Forum service listening on port ${PORT}`);

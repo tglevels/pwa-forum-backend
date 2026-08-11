@@ -13,6 +13,7 @@ export class ForumPost extends Model {
   declare view_count: number;
   declare media_url: string | null;
   declare media_type: 'image' | 'video' | null;
+  declare is_pinned: boolean;
   declare createdAt: Date;
   declare updatedAt: Date;
 }
@@ -32,6 +33,7 @@ ForumPost.init(
     view_count: { type: DataTypes.INTEGER, defaultValue: 0 },
     media_url: { type: DataTypes.STRING, allowNull: true },
     media_type: { type: DataTypes.ENUM('image', 'video'), allowNull: true },
+    is_pinned: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
   },
   { sequelize, modelName: 'ForumPost', tableName: 'forum_posts' }
 );

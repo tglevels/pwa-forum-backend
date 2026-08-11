@@ -1,8 +1,11 @@
 import { Router, Response } from 'express';
+import { Op } from 'sequelize';
 import { ForumPost } from '../models/ForumPost';
 import { ForumComment } from '../models/ForumComment';
+import { ForumVote } from '../models/ForumVote';
 import { ForumNotification } from '../models/ForumNotification';
-import { requireAuth, AuthedRequest, ADMIN_PHONE } from '../middleware/auth';
+
+import { requireAuth, isAdminIdentity, AuthedRequest ,ADMIN_PHONE } from '../middleware/auth';
 import { extractMentions } from '../lib/mentions';
 import { notifyMention, notifyOfficialMention } from '../lib/notify';
 import { OFFICIAL_HANDLE, containsOfficialMention } from '../lib/officialHandle';
@@ -25,6 +28,7 @@ function serializeComment(c: ForumComment) {
     body: c.body,
     vote_count: c.vote_count,
     status: c.status,
+    is_pinned: c.is_pinned,
     createdAt: c.createdAt,
     updatedAt: c.updatedAt,
   };
@@ -214,18 +218,134 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
 });
 
 // GET /posts/:id/comments — public flat fetch; client builds the tree from
-// parent_comment_id.
+// parent_comment_id. Pinned comments float to the top of the list so every
+// viewer sees them stuck to the top of the thread (Instagram-style).
 router.get('/', async (req: AuthedRequest, res: Response) => {
   try {
     const postId = Number(req.params.id);
     const comments = await ForumComment.findAll({
       where: { post_id: postId, status: 'visible' },
-      order: [['id', 'ASC']],
+      order: [
+        ['is_pinned', 'DESC'],
+        ['id', 'ASC'],
+      ],
       limit: 500,
     });
     return res.json({ success: true, data: comments.map(serializeComment) });
   } catch (error: any) {
     console.error('get comments error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// PATCH /posts/:id/comments/:commentId — two independent, separately-gated
+// updates share this route: pinning (`is_pinned`, admin-only, same rule as
+// post pinning) and editing the comment's own text (`body`, author-only —
+// a user may only edit their own comment, admin or not). Broadcasts the
+// update to the post room so open clients move it live without a refetch.
+router.patch('/:commentId', requireAuth, async (req: AuthedRequest, res: Response) => {
+  try {
+    const postId = Number(req.params.id);
+    const comment = await ForumComment.findOne({ where: { id: Number(req.params.commentId), post_id: postId } });
+    if (!comment) {
+      return res.status(404).json({ success: false, message: 'Comment not found' });
+    }
+
+    const wantsPin = Object.prototype.hasOwnProperty.call(req.body, 'is_pinned');
+    const wantsBodyEdit = Object.prototype.hasOwnProperty.call(req.body, 'body');
+    if (!wantsPin && !wantsBodyEdit) {
+      return res.status(400).json({ success: false, message: 'Nothing to update' });
+    }
+
+    const updates: { is_pinned?: boolean; body?: string } = {};
+
+    if (wantsPin) {
+      if (!(await isAdminIdentity(req.identity))) {
+        return res.status(403).json({ success: false, message: 'Only the admin RA can pin comments' });
+      }
+      const pinRequested = req.body.is_pinned === true || req.body.is_pinned === 'true';
+      if (pinRequested && comment.parent_comment_id !== null) {
+        return res.status(400).json({ success: false, message: 'Only top-level comments can be pinned' });
+      }
+      if (pinRequested && !comment.is_pinned) {
+        const pinnedCount = await ForumComment.count({ where: { post_id: postId, is_pinned: true } });
+        if (pinnedCount >= 3) {
+          return res.status(400).json({ success: false, message: 'Only 3 comments can be pinned per post' });
+        }
+      }
+      updates.is_pinned = pinRequested;
+    }
+
+    if (wantsBodyEdit) {
+      const isOwner = comment.user_id === req.identity!.id && comment.user_type === req.identity!.type;
+      if (!isOwner) {
+        return res.status(403).json({ success: false, message: 'You can only edit your own comment' });
+      }
+      const newBody = String(req.body.body || '').trim();
+      if (!newBody) {
+        return res.status(400).json({ success: false, message: 'body is required' });
+      }
+      updates.body = newBody;
+    }
+
+    await comment.update(updates);
+
+    const serialized = serializeComment(comment);
+    const io = req.app.get('io');
+    io.to(`post:${postId}`).emit('comment:updated', serialized);
+
+    return res.json({ success: true, data: serialized });
+  } catch (error: any) {
+    console.error('update comment error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// DELETE /posts/:id/comments/:commentId — permanently remove a comment plus
+// any nested replies, their votes and notifications. Allowed for the admin
+// RA (moderation) or the comment's own author (self-delete), same pattern
+// as post deletion (no ON DELETE CASCADE, so dependents are cleaned up in a
+// transaction first).
+router.delete('/:commentId', requireAuth, async (req: AuthedRequest, res: Response) => {
+  try {
+    const postId = Number(req.params.id);
+    const comment = await ForumComment.findOne({ where: { id: Number(req.params.commentId), post_id: postId } });
+    if (!comment) {
+      return res.status(404).json({ success: false, message: 'Comment not found' });
+    }
+
+    const isOwner = comment.user_id === req.identity!.id && comment.user_type === req.identity!.type;
+    if (!isOwner && !(await isAdminIdentity(req.identity))) {
+      return res.status(403).json({ success: false, message: 'You can only delete your own comment' });
+    }
+
+    await sequelize.transaction(async (t) => {
+      // Replies can nest arbitrarily deep, so walk the tree breadth-first to
+      // collect every descendant id, not just the immediate children.
+      const commentIds = [comment.id];
+      let frontier = [comment.id];
+      while (frontier.length) {
+        const children = await ForumComment.findAll({
+          where: { parent_comment_id: { [Op.in]: frontier } },
+          attributes: ['id'],
+          transaction: t,
+        });
+        frontier = children.map((c) => c.id);
+        commentIds.push(...frontier);
+      }
+
+      await ForumVote.destroy({ where: { target_type: 'comment', target_id: { [Op.in]: commentIds } }, transaction: t });
+      await ForumNotification.destroy({ where: { source_type: 'comment', source_id: { [Op.in]: commentIds } }, transaction: t });
+      await ForumComment.destroy({ where: { id: { [Op.in]: commentIds } }, transaction: t });
+      await ForumPost.decrement('comment_count', { by: commentIds.length, where: { id: postId }, transaction: t });
+    });
+
+    const io = req.app.get('io');
+    io.to(`post:${postId}`).emit('comment:deleted', { id: comment.id, post_id: postId });
+
+    return res.json({ success: true, data: { id: comment.id } });
+  } catch (error: any) {
+    console.error('delete comment error:', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 });

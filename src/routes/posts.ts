@@ -2,6 +2,9 @@ import { Router, Response } from 'express';
 import { Op } from 'sequelize';
 import { ForumPost } from '../models/ForumPost';
 import { ForumPostView } from '../models/ForumPostView';
+import { ForumComment } from '../models/ForumComment';
+import { ForumVote } from '../models/ForumVote';
+import { ForumNotification } from '../models/ForumNotification';
 import { RAUser } from '../models/RAUser';
 import { requireAuth, requireAdmin, AuthedRequest } from '../middleware/auth';
 import { notifyNewPost } from '../lib/notify';
@@ -36,6 +39,7 @@ async function serializePosts(posts: ForumPost[]) {
       view_count: p.view_count,
       media_url: p.media_url,
       media_type: p.media_type,
+      is_pinned: p.is_pinned,
       createdAt: p.createdAt,
       updatedAt: p.updatedAt,
     };
@@ -125,15 +129,50 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
       where.id = { [Op.lt]: Number(cursor) };
     }
 
-    const posts = await ForumPost.findAll({
-      where,
+    let pinned: ForumPost[] = [];
+    if (!cursor) {
+      pinned = await ForumPost.findAll({
+        where: { ...where, is_pinned: true },
+        order: [['id', 'DESC']],
+      });
+    }
+
+    const pinnedIds = pinned.map((p) => p.id);
+    const rest = await ForumPost.findAll({
+      where: {
+        ...where,
+        is_pinned: false,
+        ...(pinnedIds.length ? { id: { ...where.id, [Op.notIn]: pinnedIds } } : {}),
+      },
       order: [['id', 'DESC']],
       limit: capped,
     });
 
-    return res.json({ success: true, data: await serializePosts(posts) });
+    return res.json({ success: true, data: await serializePosts([...pinned, ...rest]) });
   } catch (error: any) {
     console.error('get posts error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// GET /posts/admin/all — moderation list for the RA dashboard: every post
+// (published + hidden) with pinned posts floated to the top, so a hidden post
+// stays in the list and can be toggled back to published. Admin-gated; the
+// public mobile feed keeps using /posts.
+router.get('/admin/all', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+  try {
+    const { limit } = req.query;
+    const take = Math.min(Number(limit) || 50, 100);
+
+    const pinned = await ForumPost.findAll({ where: { is_pinned: true }, order: [['id', 'DESC']] });
+    const pinnedIds = pinned.map((p) => p.id);
+    const restWhere: any = {};
+    if (pinnedIds.length) restWhere.id = { [Op.notIn]: pinnedIds };
+    const rest = await ForumPost.findAll({ where: restWhere, order: [['id', 'DESC']], limit: take });
+
+    return res.json({ success: true, data: await serializePosts([...pinned, ...rest]) });
+  } catch (error: any) {
+    console.error('get all posts error:', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 });
@@ -152,52 +191,98 @@ router.get('/:id', async (req: AuthedRequest, res: Response) => {
   }
 });
 
-// POST /posts/:id/view — record a distinct view. Idempotent per (post,
-// viewer): a repeat open of the same post by the same identity increments
-// nothing, so view_count reflects distinct viewers rather than raw opens.
-router.post('/:id/view', requireAuth, async (req: AuthedRequest, res: Response) => {
-  try {
-    const postId = Number(req.params.id);
-    const post = await ForumPost.findByPk(postId);
-    if (!post || post.status === 'hidden') {
-      return res.status(404).json({ success: false, message: 'Post not found' });
-    }
-
-    const view_count = await sequelize.transaction(async (t) => {
-      const [, created] = await ForumPostView.findOrCreate({
-        where: { post_id: postId, user_id: req.identity!.id, user_type: req.identity!.type },
-        transaction: t,
-      });
-      if (created) {
-        await post.increment('view_count', { by: 1, transaction: t });
-        await post.reload({ transaction: t });
-      }
-      return post.view_count;
-    });
-
-    return res.json({ success: true, data: { post_id: postId, view_count } });
-  } catch (error: any) {
-    console.error('record view error:', error);
-    return res.status(500).json({ success: false, message: error.message });
-  }
-});
-
-// PATCH /posts/:id — hide/moderate. Admin-gated.
-router.patch('/:id', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+// PATCH /posts/:id — hide/moderate, or edit title/body/media. Admin-gated.
+// A new "media" file replaces the existing attachment; omitting it keeps
+// whatever the post already had (same optional-replace pattern as the
+// banner module's updateBanner).
+router.patch('/:id', requireAuth, requireAdmin, upload.single('media'), async (req: AuthedRequest, res: Response) => {
   try {
     const post = await ForumPost.findByPk(Number(req.params.id));
     if (!post) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
-    const { status } = req.body;
+    const { status, title, body, is_pinned } = req.body;
     if (status && !['published', 'hidden'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status' });
     }
-    if (status) await post.update({ status });
 
-    return res.json({ success: true, data: (await serializePosts([post]))[0] });
+    const updates: Partial<ForumPost> = {};
+    if (status) updates.status = status;
+    if (title !== undefined) updates.title = String(title).slice(0, 500);
+    if (body !== undefined) updates.body = String(body);
+
+    // Cap at 3 pinned posts (WhatsApp-style) — enforce on the DB side so the
+    // RA UI and the mobile app can't drift past it.
+    const pinRequested = is_pinned === true || is_pinned === 'true';
+    if (is_pinned !== undefined) {
+      if (!pinRequested) {
+        updates.is_pinned = false;
+      } else {
+        const pinnedCount = await ForumPost.count({ where: { is_pinned: true, id: { [Op.ne]: post.id } } });
+        if (pinnedCount >= 3) {
+          return res.status(400).json({ success: false, message: 'Maximum 3 posts can be pinned at a time' });
+        }
+        updates.is_pinned = true;
+      }
+    }
+
+    const file = req.file;
+    if (file) {
+      updates.media_url = `/uploads/${file.filename}`;
+      updates.media_type = file.mimetype.startsWith('video') ? 'video' : 'image';
+    }
+
+    if (Object.keys(updates).length) await post.update(updates);
+
+    const serialized = (await serializePosts([post]))[0];
+    if ('is_pinned' in updates) {
+      const io = req.app.get('io');
+      io.to('feed').emit('post:updated', serialized);
+    }
+
+    return res.json({ success: true, data: serialized });
   } catch (error: any) {
     console.error('patch post error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// DELETE /posts/:id — permanently remove a post plus its comments, votes and
+// notifications. Admin-gated. There's no ON DELETE CASCADE (the FKs are
+// hand-written), so clean up dependents in a transaction before removing it.
+router.delete('/:id', requireAuth, requireAdmin, async (req: AuthedRequest, res: Response) => {
+  try {
+    const post = await ForumPost.findByPk(Number(req.params.id));
+    if (!post) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+
+    await sequelize.transaction(async (t) => {
+      const comments = await ForumComment.findAll({
+        where: { post_id: post.id },
+        attributes: ['id'],
+        transaction: t,
+      });
+      const commentIds = comments.map((c) => c.id);
+
+      if (commentIds.length) {
+        await ForumVote.destroy({ where: { target_type: 'comment', target_id: { [Op.in]: commentIds } }, transaction: t });
+        await ForumNotification.destroy({ where: { source_type: 'comment', source_id: { [Op.in]: commentIds } }, transaction: t });
+        await ForumComment.destroy({ where: { post_id: post.id }, transaction: t });
+      }
+
+      await ForumVote.destroy({ where: { target_type: 'post', target_id: post.id }, transaction: t });
+      await ForumNotification.destroy({ where: { source_type: 'post', source_id: post.id }, transaction: t });
+      await post.destroy({ transaction: t });
+    });
+
+    // Drop it from the live feed room.
+    const io = req.app.get('io');
+    io.to('feed').emit('post:deleted', { id: post.id });
+
+    return res.json({ success: true, data: { id: post.id } });
+  } catch (error: any) {
+    console.error('delete post error:', error);
     return res.status(500).json({ success: false, message: error.message });
   }
 });

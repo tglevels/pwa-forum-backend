@@ -16,6 +16,7 @@ export class ForumComment extends Model {
   declare body: string;
   declare vote_count: number;
   declare status: 'visible' | 'hidden';
+  declare is_pinned: boolean;
   declare createdAt: Date;
   declare updatedAt: Date;
 }
@@ -31,6 +32,7 @@ ForumComment.init(
     body: { type: DataTypes.TEXT, allowNull: false },
     vote_count: { type: DataTypes.INTEGER, defaultValue: 0 },
     status: { type: DataTypes.ENUM('visible', 'hidden'), defaultValue: 'visible' },
+    is_pinned: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },
   },
   { sequelize, modelName: 'ForumComment', tableName: 'forum_comments' }
 );

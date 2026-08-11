@@ -5,6 +5,7 @@ import { ForumPostView } from '../models/ForumPostView';
 import { ForumComment } from '../models/ForumComment';
 import { ForumVote } from '../models/ForumVote';
 import { ForumNotification } from '../models/ForumNotification';
+import { ForumViolation } from '../models/ForumViolation';
 import { RAUser } from '../models/RAUser';
 import { requireAuth, requireAdmin, AuthedRequest } from '../middleware/auth';
 import { notifyNewPost } from '../lib/notify';
@@ -191,6 +192,36 @@ router.get('/:id', async (req: AuthedRequest, res: Response) => {
   }
 });
 
+// POST /posts/:id/view — record a distinct view. Idempotent per (post,
+// viewer): a repeat open of the same post by the same identity increments
+// nothing, so view_count reflects distinct viewers rather than raw opens.
+router.post('/:id/view', requireAuth, async (req: AuthedRequest, res: Response) => {
+  try {
+    const postId = Number(req.params.id);
+    const post = await ForumPost.findByPk(postId);
+    if (!post || post.status === 'hidden') {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+
+    const view_count = await sequelize.transaction(async (t) => {
+      const [, created] = await ForumPostView.findOrCreate({
+        where: { post_id: postId, user_id: req.identity!.id, user_type: req.identity!.type },
+        transaction: t,
+      });
+      if (created) {
+        await post.increment('view_count', { by: 1, transaction: t });
+        await post.reload({ transaction: t });
+      }
+      return post.view_count;
+    });
+
+    return res.json({ success: true, data: { post_id: postId, view_count } });
+  } catch (error: any) {
+    console.error('record view error:', error);
+    return res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 // PATCH /posts/:id — hide/moderate, or edit title/body/media. Admin-gated.
 // A new "media" file replaces the existing attachment; omitting it keeps
 // whatever the post already had (same optional-replace pattern as the
@@ -268,6 +299,14 @@ router.delete('/:id', requireAuth, requireAdmin, async (req: AuthedRequest, res:
       if (commentIds.length) {
         await ForumVote.destroy({ where: { target_type: 'comment', target_id: { [Op.in]: commentIds } }, transaction: t });
         await ForumNotification.destroy({ where: { source_type: 'comment', source_id: { [Op.in]: commentIds } }, transaction: t });
+        // comment_id is a nullable FK with no ON DELETE CASCADE — null it out
+        // rather than deleting the violation rows, so a user's strike count
+        // (used for future block-on-threshold enforcement) survives the
+        // comment/post being removed.
+        await ForumViolation.update(
+          { comment_id: null },
+          { where: { comment_id: { [Op.in]: commentIds } }, transaction: t }
+        );
         await ForumComment.destroy({ where: { post_id: post.id }, transaction: t });
       }
 

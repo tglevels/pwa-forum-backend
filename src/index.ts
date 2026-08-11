@@ -12,6 +12,7 @@ import { ForumComment } from './models/ForumComment';
 import { ForumVote } from './models/ForumVote';
 import { ForumPostView } from './models/ForumPostView';
 import { ForumNotification } from './models/ForumNotification';
+import { ForumViolation } from './models/ForumViolation';
 
 // forum_posts predates the media/view_count columns — sync() only creates
 // missing tables, so add these by hand the first time they're absent.
@@ -28,6 +29,21 @@ async function ensureForumPostMediaColumns() {
   if (!columns.view_count) {
     await qi.addColumn('forum_posts', 'view_count', { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 });
   }
+}
+
+// forum_user_violations predates the 'link' violation type — sync() never
+// alters an existing enum column, so widen it by hand (additive only).
+async function ensureViolationTypeEnum() {
+  const qi = sequelize.getQueryInterface();
+  const columns = await qi.describeTable('forum_user_violations');
+  if (!columns.violation_type) return;
+  const type = columns.violation_type.type;
+  const enumSql = String(type);
+  if (enumSql.includes('link')) return;
+  await qi.changeColumn('forum_user_violations', 'violation_type', {
+    type: DataTypes.ENUM('phone_number', 'link'),
+    allowNull: false,
+  });
 }
 
 const app = express();
@@ -124,6 +140,9 @@ async function startServer() {
     await Promise.all([ForumPost.sync()]);
     await ensureForumPostMediaColumns();
     await Promise.all([ForumComment.sync(), ForumVote.sync(), ForumPostView.sync(), ForumNotification.sync()]);
+    // After ForumComment (it has an FK reference to forum_comments).
+    await ForumViolation.sync();
+    await ensureViolationTypeEnum();
 
     server.listen(PORT, () => {
       console.log(`Forum service listening on port ${PORT}`);

@@ -5,6 +5,9 @@ import { ForumNotification } from '../models/ForumNotification';
 import { requireAuth, AuthedRequest } from '../middleware/auth';
 import { extractMentions } from '../lib/mentions';
 import { notifyMention } from '../lib/notify';
+import { containsPhoneNumber, stripPhoneNumbers } from '../lib/phoneGuard';
+import { containsLink, stripLinks } from '../lib/linkGuard';
+import { ForumViolation } from '../models/ForumViolation';
 import { sequelize } from '../config/database';
 
 const router = Router({ mergeParams: true });
@@ -39,6 +42,20 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
       return res.status(400).json({ success: false, message: 'body is required' });
     }
 
+    const rawBody = String(body);
+    // Content guards: phone numbers and links are redacted before storage, and
+    // a violation strike is recorded per offense. The client also reports when
+    // it stripped either itself (phone_stripped / link_stripped) so strikes
+    // accumulate for compliant clients too — detection here covers
+    // bypassing/API traffic.
+    const phoneDetected = containsPhoneNumber(rawBody) || req.body.phone_stripped === true;
+    const linkDetected = containsLink(rawBody) || req.body.link_stripped === true;
+    // Only rewrite the body when offending content is actually present — the
+    // flags alone (client stripped it) must not alter otherwise-clean text.
+    let storedBody = rawBody;
+    if (containsPhoneNumber(rawBody)) storedBody = stripPhoneNumbers(storedBody);
+    if (containsLink(rawBody)) storedBody = stripLinks(storedBody);
+
     if (parent_comment_id) {
       const parent = await ForumComment.findByPk(Number(parent_comment_id));
       if (!parent || parent.post_id !== postId) {
@@ -46,7 +63,7 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
       }
     }
 
-    const comment = await sequelize.transaction(async (t) => {
+    const { comment, phoneStrikes, linkStrikes } = await sequelize.transaction(async (t) => {
       const created = await ForumComment.create(
         {
           post_id: postId,
@@ -54,12 +71,45 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
           user_id: req.identity!.id,
           user_type: req.identity!.type,
           author_name: author_name ? String(author_name).slice(0, 120) : null,
-          body: String(body),
+          body: storedBody,
         },
         { transaction: t }
       );
       await post.increment('comment_count', { by: 1, transaction: t });
-      return created;
+
+      let strikes = 0;
+      if (phoneDetected) {
+        await ForumViolation.create(
+          {
+            user_id: req.identity!.id,
+            user_type: req.identity!.type,
+            violation_type: 'phone_number',
+            comment_id: created.id,
+          },
+          { transaction: t }
+        );
+        strikes = await ForumViolation.count({
+          where: { user_id: req.identity!.id, user_type: req.identity!.type, violation_type: 'phone_number' },
+          transaction: t,
+        });
+      }
+      let linkStrikes = 0;
+      if (linkDetected) {
+        await ForumViolation.create(
+          {
+            user_id: req.identity!.id,
+            user_type: req.identity!.type,
+            violation_type: 'link',
+            comment_id: created.id,
+          },
+          { transaction: t }
+        );
+        linkStrikes = await ForumViolation.count({
+          where: { user_id: req.identity!.id, user_type: req.identity!.type, violation_type: 'link' },
+          transaction: t,
+        });
+      }
+      return { comment: created, phoneStrikes: strikes, linkStrikes };
     });
 
     const io = req.app.get('io');
@@ -99,7 +149,25 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
       });
     }
 
-    return res.json({ success: true, data: serialized });
+    const payload: any = { success: true, data: serialized };
+    if (phoneDetected) {
+      payload.warning = {
+        type: 'phone_number',
+        strikes: phoneStrikes,
+        // Exposed for the client, but NOT enforced yet — blocking commenting
+        // after repeated strikes is a deliberate future step.
+        strike_limit: Number(process.env.FORUM_PHONE_STRIKE_LIMIT) || 3,
+      };
+    } else if (linkDetected) {
+      payload.warning = {
+        type: 'link',
+        strikes: linkStrikes,
+        // Exposed for the client, but NOT enforced yet — blocking commenting
+        // after repeated strikes is a deliberate future step.
+        strike_limit: Number(process.env.FORUM_LINK_STRIKE_LIMIT) || 3,
+      };
+    }
+    return res.json(payload);
   } catch (error: any) {
     console.error('create comment error:', error);
     return res.status(500).json({ success: false, message: error.message });

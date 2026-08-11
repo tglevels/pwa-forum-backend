@@ -10,10 +10,11 @@ import { ForumUser } from './models/ForumUser';
 import { ForumPost } from './models/ForumPost';
 import { ForumComment } from './models/ForumComment';
 import { ForumVote } from './models/ForumVote';
+import { ForumPostView } from './models/ForumPostView';
 import { ForumNotification } from './models/ForumNotification';
 
-// forum_posts predates the media columns — sync() only creates missing
-// tables, so add these two columns by hand the first time they're absent.
+// forum_posts predates the media/view_count columns — sync() only creates
+// missing tables, so add these by hand the first time they're absent.
 // Additive-only, never touches existing rows/columns.
 async function ensureForumPostMediaColumns() {
   const qi = sequelize.getQueryInterface();
@@ -23,6 +24,9 @@ async function ensureForumPostMediaColumns() {
   }
   if (!columns.media_type) {
     await qi.addColumn('forum_posts', 'media_type', { type: DataTypes.ENUM('image', 'video'), allowNull: true });
+  }
+  if (!columns.view_count) {
+    await qi.addColumn('forum_posts', 'view_count', { type: DataTypes.INTEGER, allowNull: false, defaultValue: 0 });
   }
 }
 
@@ -119,7 +123,7 @@ async function startServer() {
     void ForumUser;
     await Promise.all([ForumPost.sync()]);
     await ensureForumPostMediaColumns();
-    await Promise.all([ForumComment.sync(), ForumVote.sync(), ForumNotification.sync()]);
+    await Promise.all([ForumComment.sync(), ForumVote.sync(), ForumPostView.sync(), ForumNotification.sync()]);
 
     server.listen(PORT, () => {
       console.log(`Forum service listening on port ${PORT}`);

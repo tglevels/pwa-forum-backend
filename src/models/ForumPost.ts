@@ -10,6 +10,7 @@ export class ForumPost extends Model {
   declare status: 'published' | 'hidden';
   declare vote_count: number;
   declare comment_count: number;
+  declare view_count: number;
   declare media_url: string | null;
   declare media_type: 'image' | 'video' | null;
   declare createdAt: Date;
@@ -28,6 +29,7 @@ ForumPost.init(
     status: { type: DataTypes.ENUM('published', 'hidden'), defaultValue: 'published' },
     vote_count: { type: DataTypes.INTEGER, defaultValue: 0 },
     comment_count: { type: DataTypes.INTEGER, defaultValue: 0 },
+    view_count: { type: DataTypes.INTEGER, defaultValue: 0 },
     media_url: { type: DataTypes.STRING, allowNull: true },
     media_type: { type: DataTypes.ENUM('image', 'video'), allowNull: true },
   },

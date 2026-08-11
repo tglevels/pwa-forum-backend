@@ -3,9 +3,11 @@ import path from 'path';
 import crypto from 'crypto';
 
 // Same disk-storage pattern as pwa-node-backend's messages.ts: random filename,
-// original extension kept so it's served with the right MIME type.
+// original extension kept so it's served with the right MIME type. Forum media
+// lives in its own 'upload' folder (not 'uploads') so it stays separate from
+// pwa-node-backend's chat attachments.
 const storage = multer.diskStorage({
-  destination: 'uploads/',
+  destination: 'upload/',
   filename: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase().slice(0, 10);
     cb(null, `${crypto.randomBytes(16).toString('hex')}${ext}`);

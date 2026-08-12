@@ -80,7 +80,10 @@ const corsOptions = {
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
 };
 
-const io = new Server(server, { cors: corsOptions });
+// Custom path so nginx can proxy this service's socket.io under
+// /forum-socket.io/ on a shared domain without colliding with
+// pwa-node-backend's socket.io at the default /socket.io/ path.
+const io = new Server(server, { path: '/forum-socket.io/', cors: corsOptions });
 
 app.use(cors(corsOptions));
 app.use(express.json());

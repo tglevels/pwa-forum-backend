@@ -7,7 +7,7 @@ module.exports = {
       cwd: "/home/ubuntu/pwa-forum-backend",
       env: {
         NODE_ENV: "production",
-        PORT: 3005,
+        PORT: 3006,
       },
       instances: 1,
       autorestart: true,

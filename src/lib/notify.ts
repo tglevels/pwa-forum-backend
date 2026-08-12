@@ -27,11 +27,12 @@ export function notifyMention(params: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      event: 'mention',
-      comment_id: params.commentId,
+      type: 'mention',
+      user_id: params.mentionedUserId,
       post_id: params.postId,
+      comment_id: params.commentId,
       body: params.commentBody || '',
-      mentioned_user_id: params.mentionedUserId,
+      actor_name: params.actorName,
       mentioned_user_type: 'user',
     }),
   }).catch((err) => console.warn('[notify-forum] mention trigger failed (non-fatal):', err.message));
@@ -51,11 +52,12 @@ export function notifyOfficialMention(params: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      event: 'mention',
-      comment_id: params.commentId,
+      type: 'mention',
+      user_id: params.adminRaId,
       post_id: params.postId,
+      comment_id: params.commentId,
       body: '',
-      mentioned_user_id: params.adminRaId,
+      actor_name: params.actorName,
       mentioned_user_type: 'ra',
     }),
   }).catch((err) => console.warn('[notify-forum] official mention trigger failed (non-fatal):', err.message));

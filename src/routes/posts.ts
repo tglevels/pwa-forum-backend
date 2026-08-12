@@ -6,6 +6,7 @@ import { ForumComment } from '../models/ForumComment';
 import { ForumVote } from '../models/ForumVote';
 import { ForumNotification } from '../models/ForumNotification';
 import { ForumViolation } from '../models/ForumViolation';
+import { ForumUserAccount } from '../models/ForumUserAccount';
 import { RAUser } from '../models/RAUser';
 import { requireAuth, requireAdmin, AuthedRequest } from '../middleware/auth';
 import { notifyNewPost } from '../lib/notify';
@@ -95,6 +96,52 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
     const io = req.app.get('io');
     const serialized = (await serializePosts([post]))[0];
     io.to('feed').emit('post:new', serialized);
+
+    // In-app inbox: every end user gets a "new post" row so their bell badge
+    // and notification list reflect it. Rows are keyed on the `users` table's
+    // user_id (the SAME namespace the forum JWT carries — ra_user_profiles.id
+    // is a different identity space and would never match a user's inbox
+    // query). Chunked bulk insert so a large user base doesn't blow the
+    // connection buffer; fan-out is non-critical, so a failure here must not
+    // fail the post itself.
+    try {
+      const accounts = await ForumUserAccount.findAll({ attributes: ['user_id'] });
+      const userIds = Array.from(
+        new Set(accounts.map((a) => String(a.user_id)).filter((id) => !!id && id !== 'undefined' && id !== 'null'))
+      );
+      if (userIds.length) {
+        const CHUNK = 500;
+        const actorId = req.identity!.id;
+        for (let i = 0; i < userIds.length; i += CHUNK) {
+          await ForumNotification.bulkCreate(
+            userIds.slice(i, i + CHUNK).map((userId) => ({
+              user_id: userId,
+              user_type: 'user' as const,
+              type: 'new_post' as const,
+              source_type: 'post' as const,
+              source_id: post.id,
+              actor_id: actorId,
+            }))
+          );
+        }
+      }
+    } catch (err) {
+      console.warn('[posts] new_post notification fan-out failed (non-fatal):', (err as Error).message);
+    }
+
+    // Live badge bump for everyone currently on the feed. id is null because a
+    // broadcast has no single owner row — the client reconciles real rows (and
+    // exact unread count) with GET /notifications on page open/reconnect.
+    io.to('feed').emit('notification:new', {
+      type: 'new_post',
+      source_type: 'post',
+      source_id: post.id,
+      post_id: post.id,
+      id: null,
+      read_at: null,
+      actor_name: author?.display_name ?? 'RA',
+      createdAt: post.createdAt,
+    });
 
     notifyNewPost({ id: post.id, title: post.title, ra_display_name: author?.display_name });
 

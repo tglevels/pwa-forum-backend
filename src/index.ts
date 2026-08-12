@@ -8,6 +8,7 @@ import { DataTypes } from 'sequelize';
 import { sequelize } from './config/database';
 import { RAUser } from './models/RAUser';
 import { ForumUser } from './models/ForumUser';
+import { ForumUserAccount } from './models/ForumUserAccount';
 import { ForumPost } from './models/ForumPost';
 import { ForumComment } from './models/ForumComment';
 import { ForumVote } from './models/ForumVote';
@@ -169,6 +170,7 @@ async function startServer() {
     // creates missing tables here, never touches ra_users/ra_user_profiles/etc.
     void RAUser;
     void ForumUser;
+    void ForumUserAccount;
     await Promise.all([ForumPost.sync()]);
     await ensureForumPostMediaColumns();
     await Promise.all([ForumComment.sync(), ForumVote.sync(), ForumPostView.sync(), ForumNotification.sync()]);

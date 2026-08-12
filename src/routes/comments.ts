@@ -17,7 +17,24 @@ import { sequelize } from '../config/database';
 
 const router = Router({ mergeParams: true });
 
-function serializeComment(c: ForumComment) {
+// Upvote/downvote split for a comment. Callers that already have a bulk map
+// (the list route) pass it in to avoid a per-comment query.
+async function serializeComment(
+  c: ForumComment,
+  votesById?: Map<number, { up: number; down: number }>
+) {
+  let votes = votesById?.get(c.id);
+  if (!votes) {
+    const rows = await ForumVote.findAll({
+      where: { target_type: 'comment', target_id: c.id },
+      attributes: ['value'],
+    });
+    votes = { up: 0, down: 0 };
+    for (const v of rows) {
+      if (v.value === 1) votes.up += 1;
+      else if (v.value === -1) votes.down += 1;
+    }
+  }
   return {
     id: c.id,
     post_id: c.post_id,
@@ -27,6 +44,8 @@ function serializeComment(c: ForumComment) {
     author_name: c.author_name,
     body: c.body,
     vote_count: c.vote_count,
+    upvote_count: votes.up,
+    downvote_count: votes.down,
     status: c.status,
     is_pinned: c.is_pinned,
     createdAt: c.createdAt,
@@ -119,7 +138,7 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
     });
 
     const io = req.app.get('io');
-    const serialized = serializeComment(comment);
+    const serialized = await serializeComment(comment);
     io.to(`post:${postId}`).emit('comment:new', serialized);
 
     // @mentions → in-app notification + push, excluding self-mentions.
@@ -231,7 +250,25 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
       ],
       limit: 500,
     });
-    return res.json({ success: true, data: comments.map(serializeComment) });
+
+    // Bulk vote split so the thread response doesn't turn into a per-comment
+    // query (up to 500 comments).
+    const commentIds = comments.map((c) => c.id);
+    const voteRows = commentIds.length
+      ? await ForumVote.findAll({
+          where: { target_type: 'comment', target_id: { [Op.in]: commentIds } },
+          attributes: ['target_id', 'value'],
+        })
+      : [];
+    const votesById = new Map<number, { up: number; down: number }>();
+    for (const v of voteRows) {
+      const cur = votesById.get(v.target_id) ?? { up: 0, down: 0 };
+      if (v.value === 1) cur.up += 1;
+      else if (v.value === -1) cur.down += 1;
+      votesById.set(v.target_id, cur);
+    }
+
+    return res.json({ success: true, data: await Promise.all(comments.map((c) => serializeComment(c, votesById))) });
   } catch (error: any) {
     console.error('get comments error:', error);
     return res.status(500).json({ success: false, message: error.message });
@@ -290,7 +327,7 @@ router.patch('/:commentId', requireAuth, async (req: AuthedRequest, res: Respons
 
     await comment.update(updates);
 
-    const serialized = serializeComment(comment);
+    const serialized = await serializeComment(comment);
     const io = req.app.get('io');
     io.to(`post:${postId}`).emit('comment:updated', serialized);
 

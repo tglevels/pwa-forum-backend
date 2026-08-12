@@ -24,8 +24,27 @@ async function serializePosts(posts: ForumPost[]) {
     ? await RAUser.findAll({ where: { ra_id: { [Op.in]: raIds } } })
     : [];
   const authorById = new Map(authors.map((a) => [a.ra_id, a]));
+
+  // Upvote/downvote split for each post, computed in one pass over the vote
+  // table so the RA dashboard can show both counts instead of the net score.
+  const postIds = posts.map((p) => p.id);
+  const voteRows = postIds.length
+    ? await ForumVote.findAll({
+        where: { target_type: 'post', target_id: { [Op.in]: postIds } },
+        attributes: ['target_id', 'value'],
+      })
+    : [];
+  const votesById = new Map<number, { up: number; down: number }>();
+  for (const v of voteRows) {
+    const cur = votesById.get(v.target_id) ?? { up: 0, down: 0 };
+    if (v.value === 1) cur.up += 1;
+    else if (v.value === -1) cur.down += 1;
+    votesById.set(v.target_id, cur);
+  }
+
   return posts.map((p) => {
     const author = authorById.get(p.ra_id);
+    const votes = votesById.get(p.id) ?? { up: 0, down: 0 };
     return {
       id: p.id,
       ra_id: p.ra_id,
@@ -36,6 +55,8 @@ async function serializePosts(posts: ForumPost[]) {
       body: p.body,
       status: p.status,
       vote_count: p.vote_count,
+      upvote_count: votes.up,
+      downvote_count: votes.down,
       comment_count: p.comment_count,
       view_count: p.view_count,
       media_url: p.media_url,

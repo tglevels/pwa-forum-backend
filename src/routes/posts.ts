@@ -10,6 +10,7 @@ import { ForumUserAccount } from '../models/ForumUserAccount';
 import { RAUser } from '../models/RAUser';
 import { requireAuth, requireAdmin, AuthedRequest } from '../middleware/auth';
 import { notifyNewPost } from '../lib/notify';
+import { sanitizeForumBody, sanitizeForumTitle, plainTextLength } from '../lib/sanitizeForumHtml';
 import { upload } from '../lib/upload';
 import { sequelize } from '../config/database';
 import commentsRouter from './comments';
@@ -77,6 +78,9 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
     if (!title || !body) {
       return res.status(400).json({ success: false, message: 'title and body are required' });
     }
+    if (plainTextLength(String(title)) > 500) {
+      return res.status(400).json({ success: false, message: 'Title is too long (max 500 characters)' });
+    }
 
     const file = req.file;
     const media_url = file ? `/upload/${file.filename}` : null;
@@ -85,8 +89,8 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
     const post = await ForumPost.create({
       ra_id: req.identity!.id,
       community_id: community_id || null,
-      title: String(title).slice(0, 500),
-      body: String(body),
+      title: sanitizeForumTitle(String(title)),
+      body: sanitizeForumBody(String(body)),
       status: 'published',
       media_url,
       media_type,
@@ -310,11 +314,14 @@ router.patch('/:id', requireAuth, requireAdmin, upload.single('media'), async (r
     if (status && !['published', 'hidden'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status' });
     }
+    if (title !== undefined && plainTextLength(String(title)) > 500) {
+      return res.status(400).json({ success: false, message: 'Title is too long (max 500 characters)' });
+    }
 
     const updates: Partial<ForumPost> = {};
     if (status) updates.status = status;
-    if (title !== undefined) updates.title = String(title).slice(0, 500);
-    if (body !== undefined) updates.body = String(body);
+    if (title !== undefined) updates.title = sanitizeForumTitle(String(title));
+    if (body !== undefined) updates.body = sanitizeForumBody(String(body));
 
     // Cap at 3 pinned posts (WhatsApp-style) — enforce on the DB side so the
     // RA UI and the mobile app can't drift past it.

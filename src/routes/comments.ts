@@ -160,7 +160,7 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
       containsOfficialMention(comment.body);
     const mentionedIds = rawMentionedIds.filter((id) => id.toLowerCase() !== OFFICIAL_HANDLE.id);
     for (const mentionedUserId of mentionedIds) {
-      await ForumNotification.create({
+      const notif = await ForumNotification.create({
         user_id: mentionedUserId,
         user_type: 'user',
         type: 'mention',
@@ -169,10 +169,14 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
         actor_id: req.identity!.id,
       });
       io.to(`user:${mentionedUserId}`).emit('notification:new', {
+        id: notif.id,
         type: 'mention',
+        source_type: 'comment',
+        source_id: comment.id,
         post_id: postId,
-        comment_id: comment.id,
+        read_at: null,
         actor_name: comment.author_name,
+        createdAt: notif.createdAt,
       });
       notifyMention({
         mentionedUserId,
@@ -185,7 +189,7 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
     if (officialMentioned) {
       const adminRa = await RAUser.findOne({ where: { phone_number: ADMIN_PHONE, status: 'active' } });
       if (adminRa) {
-        await ForumNotification.create({
+        const notif = await ForumNotification.create({
           user_id: adminRa.ra_id,
           user_type: 'ra',
           type: 'mention',
@@ -194,11 +198,14 @@ router.post('/', requireAuth, async (req: AuthedRequest, res: Response) => {
           actor_id: req.identity!.id,
         });
         io.to(`user:${adminRa.ra_id}`).emit('notification:new', {
+          id: notif.id,
           type: 'mention',
-          mention: 'official',
+          source_type: 'comment',
+          source_id: comment.id,
           post_id: postId,
-          comment_id: comment.id,
+          read_at: null,
           actor_name: comment.author_name,
+          createdAt: notif.createdAt,
         });
         notifyOfficialMention({
           adminRaId: adminRa.ra_id,

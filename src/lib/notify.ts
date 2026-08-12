@@ -2,8 +2,24 @@
 // send-message route does today. Scope stays narrow per the plan: mentions
 // and new admin posts only — not votes or every reply.
 const PWA_NOTIFY_URL = process.env.PWA_NOTIFY_URL || 'http://localhost:3001';
+// Origin the forum service's /upload media is publicly reachable at — used to
+// resolve the relative media_url into an absolute one the browser's
+// notification renderer can fetch (mirrors the PWA's resolveForumMediaUrl).
+const FORUM_BASE_URL = process.env.FORUM_BASE_URL || 'http://localhost:3006';
 
-export function notifyNewPost(post: { id: number; title: string; ra_display_name?: string }) {
+function absoluteForumUrl(path?: string | null): string | undefined {
+  if (!path) return undefined;
+  if (/^https?:\/\//i.test(path)) return path;
+  return `${FORUM_BASE_URL}${path.startsWith('/') ? '' : '/'}${path}`;
+}
+
+export function notifyNewPost(post: {
+  id: number;
+  title: string;
+  ra_display_name?: string;
+  media_url?: string | null;
+  media_type?: string | null;
+}) {
   fetch(`${PWA_NOTIFY_URL}/notify-forum`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -12,6 +28,8 @@ export function notifyNewPost(post: { id: number; title: string; ra_display_name
       post_id: post.id,
       title: post.title,
       actor_name: post.ra_display_name,
+      // Only image posts get a notification image (videos have no poster here).
+      image_url: post.media_type === 'image' ? absoluteForumUrl(post.media_url) : undefined,
     }),
   }).catch((err) => console.warn('[notify-forum] new_post trigger failed (non-fatal):', err.message));
 }
@@ -27,11 +45,12 @@ export function notifyMention(params: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      event: 'mention',
-      comment_id: params.commentId,
+      type: 'mention',
+      user_id: params.mentionedUserId,
       post_id: params.postId,
+      comment_id: params.commentId,
       body: params.commentBody || '',
-      mentioned_user_id: params.mentionedUserId,
+      actor_name: params.actorName,
       mentioned_user_type: 'user',
     }),
   }).catch((err) => console.warn('[notify-forum] mention trigger failed (non-fatal):', err.message));
@@ -51,11 +70,12 @@ export function notifyOfficialMention(params: {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      event: 'mention',
-      comment_id: params.commentId,
+      type: 'mention',
+      user_id: params.adminRaId,
       post_id: params.postId,
+      comment_id: params.commentId,
       body: '',
-      mentioned_user_id: params.adminRaId,
+      actor_name: params.actorName,
       mentioned_user_type: 'ra',
     }),
   }).catch((err) => console.warn('[notify-forum] official mention trigger failed (non-fatal):', err.message));

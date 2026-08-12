@@ -143,7 +143,13 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
       createdAt: post.createdAt,
     });
 
-    notifyNewPost({ id: post.id, title: post.title, ra_display_name: author?.display_name });
+    notifyNewPost({
+      id: post.id,
+      title: post.title,
+      ra_display_name: author?.display_name,
+      media_url: post.media_url,
+      media_type: post.media_type,
+    });
 
     return res.json({ success: true, data: serialized });
   } catch (error: any) {

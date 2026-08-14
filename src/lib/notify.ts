@@ -56,7 +56,7 @@ export function notifyMention(params: {
       user_id: params.mentionedUserId,
       post_id: params.postId,
       comment_id: params.commentId,
-      body: params.commentBody || '',
+      body: stripHtml(params.commentBody || ''),
       actor_name: params.actorName,
       mentioned_user_type: 'user',
     }),

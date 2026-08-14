@@ -13,6 +13,13 @@ function absoluteForumUrl(path?: string | null): string | undefined {
   return `${FORUM_BASE_URL}${path.startsWith('/') ? '' : '/'}${path}`;
 }
 
+// Push notification bodies render as plain text (lock screen, notification
+// tray) — a title composed with the RA's rich text editor may carry
+// <strong>/<em> tags that would otherwise show up literally.
+function stripHtml(html: string): string {
+  return html.replace(/<[^>]+>/g, '');
+}
+
 export function notifyNewPost(post: {
   id: number;
   title: string;
@@ -26,7 +33,7 @@ export function notifyNewPost(post: {
     body: JSON.stringify({
       type: 'new_post',
       post_id: post.id,
-      title: post.title,
+      title: stripHtml(post.title),
       actor_name: post.ra_display_name,
       // Only image posts get a notification image (videos have no poster here).
       image_url: post.media_type === 'image' ? absoluteForumUrl(post.media_url) : undefined,

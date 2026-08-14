@@ -17,11 +17,36 @@ import { sequelize } from '../config/database';
 
 const router = Router({ mergeParams: true });
 
+// Preset avatar filename (public/avatars/ in tglevel_mobile_pwa — assigned at
+// signup, upgraded once gender is known) lives on the `users` table, which
+// this service doesn't otherwise model — it's the same physical DB
+// pwa-node-backend uses, so a raw query is enough; no cross-service HTTP
+// call needed. RAs use author_avatar (an actual image) instead, so this is
+// 'user' comments only.
+async function fetchAvatarFileByUserId(userIds: string[]): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  const uniq = Array.from(new Set(userIds.filter(Boolean)));
+  if (!uniq.length) return out;
+  try {
+    const rows: any[] = await sequelize.query(
+      'SELECT user_id, avatar_file FROM users WHERE user_id IN (:ids) AND avatar_file IS NOT NULL',
+      { replacements: { ids: uniq }, type: 'SELECT' as any }
+    );
+    for (const r of rows) out.set(String(r.user_id), String(r.avatar_file));
+  } catch (err: any) {
+    console.error('fetchAvatarFileByUserId failed (non-fatal, falls back to initials):', err.message);
+  }
+  return out;
+}
+
 // Upvote/downvote split for a comment. Callers that already have a bulk map
-// (the list route) pass it in to avoid a per-comment query.
+// (the list route) pass it in to avoid a per-comment query. Same for
+// avatarByUserId — the list route resolves it once for every author on the
+// page instead of per comment.
 async function serializeComment(
   c: ForumComment,
-  votesById?: Map<number, { up: number; down: number }>
+  votesById?: Map<number, { up: number; down: number }>,
+  avatarByUserId?: Map<string, string>
 ) {
   let votes = votesById?.get(c.id);
   if (!votes) {
@@ -35,6 +60,10 @@ async function serializeComment(
       else if (v.value === -1) votes.down += 1;
     }
   }
+  const avatarFile =
+    c.user_type === 'user'
+      ? (avatarByUserId ?? (await fetchAvatarFileByUserId([c.user_id]))).get(c.user_id) ?? null
+      : null;
   return {
     id: c.id,
     post_id: c.post_id,
@@ -42,6 +71,7 @@ async function serializeComment(
     user_id: c.user_id,
     user_type: c.user_type,
     author_name: c.author_name,
+    author_avatar_file: avatarFile,
     body: c.body,
     vote_count: c.vote_count,
     upvote_count: votes.up,
@@ -275,7 +305,14 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
       votesById.set(v.target_id, cur);
     }
 
-    return res.json({ success: true, data: await Promise.all(comments.map((c) => serializeComment(c, votesById))) });
+    const avatarByUserId = await fetchAvatarFileByUserId(
+      comments.filter((c) => c.user_type === 'user').map((c) => c.user_id)
+    );
+
+    return res.json({
+      success: true,
+      data: await Promise.all(comments.map((c) => serializeComment(c, votesById, avatarByUserId))),
+    });
   } catch (error: any) {
     console.error('get comments error:', error);
     return res.status(500).json({ success: false, message: error.message });

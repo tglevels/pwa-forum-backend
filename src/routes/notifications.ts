@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import { Op } from 'sequelize';
 import { ForumNotification } from '../models/ForumNotification';
 import { ForumComment } from '../models/ForumComment';
+import { ForumPost } from '../models/ForumPost';
 import { RAUser } from '../models/RAUser';
 import { requireAuth, AuthedRequest } from '../middleware/auth';
 
@@ -32,6 +33,12 @@ router.get('/', requireAuth, async (req: AuthedRequest, res: Response) => {
     const commentIds = notifications
       .filter((n) => n.source_type === 'comment')
       .map((n) => n.source_id);
+    // 'post' rows carry the post's own id as source_id (see posts.ts's
+    // notification fan-out); 'comment' rows need the comment's post_id
+    // instead, resolved below once the comments themselves are loaded.
+    const directPostIds = notifications
+      .filter((n) => n.source_type === 'post')
+      .map((n) => n.source_id);
     const raIds = Array.from(
       new Set(notifications.filter((n) => n.source_type === 'post').map((n) => n.actor_id).filter((id): id is string => !!id))
     );
@@ -46,8 +53,20 @@ router.get('/', requireAuth, async (req: AuthedRequest, res: Response) => {
     const commentById = new Map(comments.map((c) => [c.id, c]));
     const raNameById = new Map(raActors.map((a) => [String(a.ra_id), a.display_name]));
 
+    // Both a mention (via its comment's post) and a new-post row point at a
+    // post — batch-fetch the union of both id sets in one query so every
+    // notification can show that post's title/image, not just new-post rows.
+    const allPostIds = Array.from(
+      new Set([...directPostIds, ...comments.map((c) => c.post_id)])
+    );
+    const posts = allPostIds.length
+      ? await ForumPost.findAll({ where: { id: { [Op.in]: allPostIds } }, attributes: ['id', 'title', 'media_url', 'media_type'] })
+      : [];
+    const postById = new Map(posts.map((p) => [p.id, p]));
+
     const data = notifications.map((n) => {
       const comment = n.source_type === 'comment' ? commentById.get(n.source_id) : undefined;
+      const post = n.source_type === 'comment' ? postById.get(comment?.post_id ?? -1) : postById.get(n.source_id);
       return {
         ...n.toJSON(),
         actor_name:
@@ -57,7 +76,10 @@ router.get('/', requireAuth, async (req: AuthedRequest, res: Response) => {
               ? (raNameById.get(String(n.actor_id)) ?? null)
               : null,
         comment_body: comment?.body ?? null,
-        post_id: comment?.post_id ?? null,
+        post_id: comment?.post_id ?? (post ? post.id : null),
+        post_title: post?.title ?? null,
+        // Only image posts get a thumbnail — videos have no poster here.
+        post_image_url: post && post.media_type === 'image' ? post.media_url : null,
       };
     });
 

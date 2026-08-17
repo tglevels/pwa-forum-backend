@@ -90,11 +90,12 @@ app.use(cors(corsOptions));
 app.use(express.json());
 app.set('io', io);
 
-// Post media (images/video), served at /upload/<file> from the forum service's
-// own 'upload' folder (singular — distinct from pwa-node-backend's '/uploads'
-// chat attachments). Same static-serve pattern otherwise.
+// Post media (images/video) and preset avatars, both served at /upload/<file>
+// — post media from the forum service's own 'upload' folder (singular —
+// distinct from pwa-node-backend's '/uploads' chat attachments), avatars from
+// the 'avatars' folder. Single route so every caller only needs one path.
 app.use('/upload', express.static('upload', { maxAge: '30d', immutable: true }));
-app.use('/avatars', express.static('avatars', { maxAge: '30d', immutable: true }));
+app.use('/upload', express.static('avatars', { maxAge: '30d', immutable: true }));
 
 // multer's diskStorage doesn't create its destination directory — make sure the
 // 'upload' folder exists on boot (cwd-relative, matching the multer/static

@@ -94,6 +94,7 @@ app.set('io', io);
 // own 'upload' folder (singular — distinct from pwa-node-backend's '/uploads'
 // chat attachments). Same static-serve pattern otherwise.
 app.use('/upload', express.static('upload', { maxAge: '30d', immutable: true }));
+app.use('/avatars', express.static('avatars', { maxAge: '30d', immutable: true }));
 
 // multer's diskStorage doesn't create its destination directory — make sure the
 // 'upload' folder exists on boot (cwd-relative, matching the multer/static

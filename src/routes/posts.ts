@@ -241,6 +241,7 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
     const capped = Math.min(Number(limit) || 20, 50);
 
     if (sort === 'trending' || tab === 'trending') {
+      const trendingLimit = Math.min(Number(limit) || 10, 50);
       const windowStart = new Date(Date.now() - TRENDING_WINDOW_DAYS * 86400000);
       const candidates = await ForumPost.findAll({
         where: { status: 'published', createdAt: { [Op.gte]: windowStart } },
@@ -250,7 +251,7 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
       const ranked = candidates
         .slice()
         .sort((a, b) => trendingScore(b) - trendingScore(a))
-        .slice(0, capped);
+        .slice(0, trendingLimit);
       return res.json({ success: true, data: await serializePosts(ranked) });
     }
 

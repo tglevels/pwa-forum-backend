@@ -8,6 +8,8 @@ import { ForumNotification } from '../models/ForumNotification';
 import { ForumViolation } from '../models/ForumViolation';
 import { ForumUserAccount } from '../models/ForumUserAccount';
 import { RAUser } from '../models/RAUser';
+import { ForumTab } from '../models/ForumTab';
+import { ForumPostTab } from '../models/ForumPostTab';
 import { requireAuth, requireAdmin, AuthedRequest } from '../middleware/auth';
 import { notifyNewPost } from '../lib/notify';
 import { sanitizeForumBody, sanitizeForumTitle, plainTextLength } from '../lib/sanitizeForumHtml';
@@ -44,6 +46,23 @@ async function serializePosts(posts: ForumPost[]) {
     votesById.set(v.target_id, cur);
   }
 
+  // Tabs a post belongs to (never includes 'trending' — that's computed, not
+  // a bucket). Batched in one pass so the feed list doesn't do N+1 lookups.
+  const postTabRows = postIds.length
+    ? await ForumPostTab.findAll({ where: { post_id: { [Op.in]: postIds } } })
+    : [];
+  const tabIds = Array.from(new Set(postTabRows.map((r) => r.tab_id)));
+  const tabs = tabIds.length ? await ForumTab.findAll({ where: { id: { [Op.in]: tabIds } } }) : [];
+  const tabById = new Map(tabs.map((t) => [t.id, t]));
+  const tabsByPostId = new Map<number, { id: number; slug: string; name: string }[]>();
+  for (const row of postTabRows) {
+    const tab = tabById.get(row.tab_id);
+    if (!tab) continue;
+    const list = tabsByPostId.get(row.post_id) ?? [];
+    list.push({ id: tab.id, slug: tab.slug, name: tab.name });
+    tabsByPostId.set(row.post_id, list);
+  }
+
   return posts.map((p) => {
     const author = authorById.get(p.ra_id);
     const votes = votesById.get(p.id) ?? { up: 0, down: 0 };
@@ -64,10 +83,29 @@ async function serializePosts(posts: ForumPost[]) {
       media_url: p.media_url,
       media_type: p.media_type,
       is_pinned: p.is_pinned,
+      tabs: tabsByPostId.get(p.id) ?? [],
       createdAt: p.createdAt,
       updatedAt: p.updatedAt,
     };
   });
+}
+
+// Resolve the tab_ids a new post should be filed under. Empty/omitted input
+// defaults to just the 'new' system tab; 'trending' is silently dropped if
+// ever passed since it's never a real bucket. Invalid/unknown ids are dropped
+// rather than rejected, so a stale client payload can't fail the whole post.
+async function resolvePostTabIds(requested: unknown): Promise<number[]> {
+  const requestedIds = Array.isArray(requested)
+    ? requested.map((v) => Number(v)).filter((n) => Number.isFinite(n))
+    : [];
+
+  if (!requestedIds.length) {
+    const newTab = await ForumTab.findOne({ where: { slug: 'new' } });
+    return newTab ? [newTab.id] : [];
+  }
+
+  const tabs = await ForumTab.findAll({ where: { id: { [Op.in]: requestedIds }, is_active: true } });
+  return tabs.filter((t) => t.slug !== 'trending').map((t) => t.id);
 }
 
 // POST /posts — RA composer only (TG-RA-Frontend). Admin-gated. Accepts an
@@ -77,6 +115,16 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
     const { title, body, community_id } = req.body;
     if (!title || !body) {
       return res.status(400).json({ success: false, message: 'title and body are required' });
+    }
+    // multipart/form-data can't send a real array, so the composer sends
+    // tab_ids as a JSON string; a normal JSON body may already send an array.
+    let requestedTabIds: unknown = req.body.tab_ids;
+    if (typeof requestedTabIds === 'string') {
+      try {
+        requestedTabIds = JSON.parse(requestedTabIds);
+      } catch {
+        requestedTabIds = [requestedTabIds];
+      }
     }
     if (plainTextLength(String(title)) > 500) {
       return res.status(400).json({ success: false, message: 'Title is too long (max 500 characters)' });
@@ -95,6 +143,11 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
       media_url,
       media_type,
     });
+
+    const tabIds = await resolvePostTabIds(requestedTabIds);
+    if (tabIds.length) {
+      await ForumPostTab.bulkCreate(tabIds.map((tab_id) => ({ post_id: post.id, tab_id })));
+    }
 
     const author = await RAUser.findByPk(req.identity!.id);
     const io = req.app.get('io');
@@ -184,10 +237,10 @@ function trendingScore(post: ForumPost): number {
 // (trending ignores since/cursor — it's always a fresh top-N, not a page).
 router.get('/', async (req: AuthedRequest, res: Response) => {
   try {
-    const { since, cursor, limit, sort } = req.query;
+    const { since, cursor, limit, sort, tab } = req.query;
     const capped = Math.min(Number(limit) || 20, 50);
 
-    if (sort === 'trending') {
+    if (sort === 'trending' || tab === 'trending') {
       const windowStart = new Date(Date.now() - TRENDING_WINDOW_DAYS * 86400000);
       const candidates = await ForumPost.findAll({
         where: { status: 'published', createdAt: { [Op.gte]: windowStart } },
@@ -206,6 +259,24 @@ router.get('/', async (req: AuthedRequest, res: Response) => {
       where.createdAt = { [Op.gt]: new Date(String(since)) };
     } else if (cursor) {
       where.id = { [Op.lt]: Number(cursor) };
+    }
+
+    // ?tab=<slug> scopes the feed to posts filed under a specific tab (custom
+    // tab, or 'new' — which is just every post, same as no filter, since
+    // every post gets 'new' by default). Unknown slug -> empty result rather
+    // than silently falling back to the unfiltered feed.
+    let tabPostIds: number[] | null = null;
+    if (tab && tab !== 'new') {
+      const tabRow = await ForumTab.findOne({ where: { slug: String(tab) } });
+      if (!tabRow) {
+        return res.json({ success: true, data: [] });
+      }
+      const rows = await ForumPostTab.findAll({ where: { tab_id: tabRow.id }, attributes: ['post_id'] });
+      tabPostIds = rows.map((r) => r.post_id);
+      if (!tabPostIds.length) {
+        return res.json({ success: true, data: [] });
+      }
+      where.id = { ...(where.id ?? {}), [Op.in]: tabPostIds };
     }
 
     let pinned: ForumPost[] = [];
@@ -346,6 +417,24 @@ router.patch('/:id', requireAuth, requireAdmin, upload.single('media'), async (r
 
     if (Object.keys(updates).length) await post.update(updates);
 
+    // tab_ids is optional and, when present, fully replaces the post's tab
+    // assignments (not merged) — same shape as the composer's create form.
+    if (req.body.tab_ids !== undefined) {
+      let requestedTabIds: unknown = req.body.tab_ids;
+      if (typeof requestedTabIds === 'string') {
+        try {
+          requestedTabIds = JSON.parse(requestedTabIds);
+        } catch {
+          requestedTabIds = [requestedTabIds];
+        }
+      }
+      const tabIds = await resolvePostTabIds(requestedTabIds);
+      await ForumPostTab.destroy({ where: { post_id: post.id } });
+      if (tabIds.length) {
+        await ForumPostTab.bulkCreate(tabIds.map((tab_id) => ({ post_id: post.id, tab_id })));
+      }
+    }
+
     const serialized = (await serializePosts([post]))[0];
     if ('is_pinned' in updates) {
       const io = req.app.get('io');
@@ -393,6 +482,7 @@ router.delete('/:id', requireAuth, requireAdmin, async (req: AuthedRequest, res:
 
       await ForumVote.destroy({ where: { target_type: 'post', target_id: post.id }, transaction: t });
       await ForumNotification.destroy({ where: { source_type: 'post', source_id: post.id }, transaction: t });
+      await ForumPostTab.destroy({ where: { post_id: post.id }, transaction: t });
       await post.destroy({ transaction: t });
     });
 

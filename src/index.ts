@@ -15,6 +15,8 @@ import { ForumVote } from './models/ForumVote';
 import { ForumPostView } from './models/ForumPostView';
 import { ForumNotification } from './models/ForumNotification';
 import { ForumViolation } from './models/ForumViolation';
+import { ForumTab } from './models/ForumTab';
+import { ForumPostTab } from './models/ForumPostTab';
 
 // forum_comments predates the is_pinned column — sync() only creates missing
 // tables, so add it by hand the first time it's absent. Additive-only, never
@@ -68,6 +70,20 @@ async function ensureViolationTypeEnum() {
       defaultValue: false,
     });
   }
+}
+
+// Seed the two pinned system tabs once, idempotently. 'trending' never
+// collects forum_post_tabs rows (its feed stays the computed ranking in
+// posts.ts) — the row only exists so GET /tabs can list it in the bar.
+async function ensureSystemTabs() {
+  await ForumTab.findOrCreate({
+    where: { slug: 'new' },
+    defaults: { slug: 'new', name: 'New', type: 'system', sort_order: 0 },
+  });
+  await ForumTab.findOrCreate({
+    where: { slug: 'trending' },
+    defaults: { slug: 'trending', name: 'Trending', type: 'system', sort_order: 1 },
+  });
 }
 
 const app = express();
@@ -155,11 +171,13 @@ import postsRoutes from './routes/posts';
 import votesRoutes from './routes/votes';
 import notificationsRoutes from './routes/notifications';
 import usersRoutes from './routes/users';
+import tabsRoutes from './routes/tabs';
 
 app.use('/api/v1/forum/posts', postsRoutes);
 app.use('/api/v1/forum/votes', votesRoutes);
 app.use('/api/v1/forum/notifications', notificationsRoutes);
 app.use('/api/v1/forum/users', usersRoutes);
+app.use('/api/v1/forum/tabs', tabsRoutes);
 
 const PORT = process.env.PORT || 3005;
 
@@ -179,8 +197,13 @@ async function startServer() {
     // After ForumComment (it has an FK reference to forum_comments).
     await ForumViolation.sync();
     await ensureViolationTypeEnum();
-    
+
     await ensureForumCommentPinnedColumn();
+
+    await ForumTab.sync();
+    await ensureSystemTabs();
+    // After ForumTab/ForumPost (it FK-references both).
+    await ForumPostTab.sync();
 
     server.listen(PORT, () => {
       console.log(`Forum service listening on port ${PORT}`);

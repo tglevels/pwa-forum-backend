@@ -172,12 +172,14 @@ import votesRoutes from './routes/votes';
 import notificationsRoutes from './routes/notifications';
 import usersRoutes from './routes/users';
 import tabsRoutes from './routes/tabs';
+import analyticsRoutes from './routes/analytics';
 
 app.use('/api/v1/forum/posts', postsRoutes);
 app.use('/api/v1/forum/votes', votesRoutes);
 app.use('/api/v1/forum/notifications', notificationsRoutes);
 app.use('/api/v1/forum/users', usersRoutes);
 app.use('/api/v1/forum/tabs', tabsRoutes);
+app.use('/api/v1/forum/analytics', analyticsRoutes);
 
 const PORT = process.env.PORT || 3005;
 

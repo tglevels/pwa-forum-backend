@@ -448,6 +448,11 @@ router.get('/posts', requireAuth, requireAdmin, async (req: AuthedRequest, res: 
     if (status === 'published' || status === 'hidden') {
       whereClauses.push('p.status = :status');
       replacements.status = status;
+    } else {
+      // Analytics measures live/visible engagement — a 'scheduled' post hasn't
+      // been published yet (no views/votes to report), so leave it out unless
+      // the RA explicitly filters to a status.
+      whereClauses.push("p.status IN ('published', 'hidden')");
     }
     if (mediaType === 'image' || mediaType === 'video') {
       whereClauses.push('p.media_type = :mediaType');

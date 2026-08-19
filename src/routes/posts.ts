@@ -14,6 +14,7 @@ import { requireAuth, requireAdmin, AuthedRequest } from '../middleware/auth';
 import { notifyNewPost } from '../lib/notify';
 import { sanitizeForumBody, sanitizeForumTitle, plainTextLength } from '../lib/sanitizeForumHtml';
 import { upload } from '../lib/upload';
+import { toIstWallClock, parseIstWallClock } from '../lib/ist';
 import { sequelize } from '../config/database';
 import commentsRouter from './comments';
 
@@ -75,6 +76,7 @@ async function serializePosts(posts: ForumPost[]) {
       title: p.title,
       body: p.body,
       status: p.status,
+      scheduled_for: toIstWallClock(p.scheduled_for),
       vote_count: p.vote_count,
       upvote_count: votes.up,
       downvote_count: votes.down,
@@ -108,11 +110,85 @@ async function resolvePostTabIds(requested: unknown): Promise<number[]> {
   return tabs.filter((t) => t.slug !== 'trending').map((t) => t.id);
 }
 
+// Everything that has to happen the moment a post actually goes live: flip it
+// to 'published' if it wasn't already, broadcast it to the live feed, fan out
+// the in-app notification inbox, and send the push. Shared by two callers —
+// POST /posts (immediate publish) and index.ts's scheduler poller (a
+// scheduled post whose time arrived) — so "going live" means exactly the same
+// thing regardless of which path triggered it.
+export async function publishPost(io: any, post: ForumPost, actorId: string) {
+  if (post.status !== 'published') {
+    await post.update({ status: 'published' });
+  }
+
+  const author = await RAUser.findByPk(post.ra_id);
+  const serialized = (await serializePosts([post]))[0];
+  io.to('feed').emit('post:new', serialized);
+
+  // In-app inbox: every end user gets a "new post" row so their bell badge
+  // and notification list reflect it. Rows are keyed on the `users` table's
+  // user_id (the SAME namespace the forum JWT carries — ra_user_profiles.id
+  // is a different identity space and would never match a user's inbox
+  // query). Chunked bulk insert so a large user base doesn't blow the
+  // connection buffer; fan-out is non-critical, so a failure here must not
+  // fail the post itself.
+  try {
+    const accounts = await ForumUserAccount.findAll({ attributes: ['user_id'] });
+    const userIds = Array.from(
+      new Set(accounts.map((a) => String(a.user_id)).filter((id) => !!id && id !== 'undefined' && id !== 'null'))
+    );
+    if (userIds.length) {
+      const CHUNK = 500;
+      for (let i = 0; i < userIds.length; i += CHUNK) {
+        await ForumNotification.bulkCreate(
+          userIds.slice(i, i + CHUNK).map((userId) => ({
+            user_id: userId,
+            user_type: 'user' as const,
+            type: 'new_post' as const,
+            source_type: 'post' as const,
+            source_id: post.id,
+            actor_id: actorId,
+          }))
+        );
+      }
+    }
+  } catch (err) {
+    console.warn('[posts] new_post notification fan-out failed (non-fatal):', (err as Error).message);
+  }
+
+  // Live badge bump for everyone currently on the feed. id is null because a
+  // broadcast has no single owner row — the client reconciles real rows (and
+  // exact unread count) with GET /notifications on page open/reconnect.
+  io.to('feed').emit('notification:new', {
+    type: 'new_post',
+    source_type: 'post',
+    source_id: post.id,
+    post_id: post.id,
+    id: null,
+    read_at: null,
+    actor_name: author?.display_name ?? 'RA',
+    createdAt: post.createdAt,
+  });
+
+  notifyNewPost({
+    id: post.id,
+    title: post.title,
+    ra_display_name: author?.display_name,
+    media_url: post.media_url,
+    media_type: post.media_type,
+  });
+
+  return serialized;
+}
+
 // POST /posts — RA composer only (TG-RA-Frontend). Admin-gated. Accepts an
 // optional multipart "media" field (image or video) alongside title/body.
+// An optional scheduled_for (ISO datetime, future) creates it as
+// status='scheduled' instead of publishing immediately — index.ts's poller
+// picks it up and runs it through publishPost() once that time arrives.
 router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: AuthedRequest, res: Response) => {
   try {
-    const { title, body, community_id } = req.body;
+    const { title, body, community_id, scheduled_for } = req.body;
     if (!title || !body) {
       return res.status(400).json({ success: false, message: 'title and body are required' });
     }
@@ -130,6 +206,14 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
       return res.status(400).json({ success: false, message: 'Title is too long (max 500 characters)' });
     }
 
+    let scheduledDate: Date | null = null;
+    if (scheduled_for) {
+      scheduledDate = parseIstWallClock(String(scheduled_for));
+      if (!scheduledDate || scheduledDate.getTime() <= Date.now()) {
+        return res.status(400).json({ success: false, message: 'scheduled_for must be a valid future date/time' });
+      }
+    }
+
     const file = req.file;
     const media_url = file ? `/upload/${file.filename}` : null;
     const media_type = file ? (file.mimetype.startsWith('video') ? 'video' : 'image') : null;
@@ -139,7 +223,8 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
       community_id: community_id || null,
       title: sanitizeForumTitle(String(title)),
       body: sanitizeForumBody(String(body)),
-      status: 'published',
+      status: scheduledDate ? 'scheduled' : 'published',
+      scheduled_for: scheduledDate,
       media_url,
       media_type,
     });
@@ -149,65 +234,15 @@ router.post('/', requireAuth, requireAdmin, upload.single('media'), async (req: 
       await ForumPostTab.bulkCreate(tabIds.map((tab_id) => ({ post_id: post.id, tab_id })));
     }
 
-    const author = await RAUser.findByPk(req.identity!.id);
-    const io = req.app.get('io');
-    const serialized = (await serializePosts([post]))[0];
-    io.to('feed').emit('post:new', serialized);
-
-    // In-app inbox: every end user gets a "new post" row so their bell badge
-    // and notification list reflect it. Rows are keyed on the `users` table's
-    // user_id (the SAME namespace the forum JWT carries — ra_user_profiles.id
-    // is a different identity space and would never match a user's inbox
-    // query). Chunked bulk insert so a large user base doesn't blow the
-    // connection buffer; fan-out is non-critical, so a failure here must not
-    // fail the post itself.
-    try {
-      const accounts = await ForumUserAccount.findAll({ attributes: ['user_id'] });
-      const userIds = Array.from(
-        new Set(accounts.map((a) => String(a.user_id)).filter((id) => !!id && id !== 'undefined' && id !== 'null'))
-      );
-      if (userIds.length) {
-        const CHUNK = 500;
-        const actorId = req.identity!.id;
-        for (let i = 0; i < userIds.length; i += CHUNK) {
-          await ForumNotification.bulkCreate(
-            userIds.slice(i, i + CHUNK).map((userId) => ({
-              user_id: userId,
-              user_type: 'user' as const,
-              type: 'new_post' as const,
-              source_type: 'post' as const,
-              source_id: post.id,
-              actor_id: actorId,
-            }))
-          );
-        }
-      }
-    } catch (err) {
-      console.warn('[posts] new_post notification fan-out failed (non-fatal):', (err as Error).message);
+    // Scheduled posts skip every "going live" side-effect until their time
+    // actually arrives — the poller in index.ts calls publishPost() for them.
+    if (scheduledDate) {
+      const serialized = (await serializePosts([post]))[0];
+      return res.json({ success: true, data: serialized });
     }
 
-    // Live badge bump for everyone currently on the feed. id is null because a
-    // broadcast has no single owner row — the client reconciles real rows (and
-    // exact unread count) with GET /notifications on page open/reconnect.
-    io.to('feed').emit('notification:new', {
-      type: 'new_post',
-      source_type: 'post',
-      source_id: post.id,
-      post_id: post.id,
-      id: null,
-      read_at: null,
-      actor_name: author?.display_name ?? 'RA',
-      createdAt: post.createdAt,
-    });
-
-    notifyNewPost({
-      id: post.id,
-      title: post.title,
-      ra_display_name: author?.display_name,
-      media_url: post.media_url,
-      media_type: post.media_type,
-    });
-
+    const io = req.app.get('io');
+    const serialized = await publishPost(io, post, req.identity!.id);
     return res.json({ success: true, data: serialized });
   } catch (error: any) {
     console.error('create post error:', error);
@@ -328,11 +363,13 @@ router.get('/admin/all', requireAuth, requireAdmin, async (req: AuthedRequest, r
   }
 });
 
-// GET /posts/:id — single post.
+// GET /posts/:id — single post. Allow-list, not a deny-list: a 'scheduled'
+// post must 404 here too (not just be absent from the feed list), or its
+// direct URL/share-preview would leak it before it's actually live.
 router.get('/:id', async (req: AuthedRequest, res: Response) => {
   try {
     const post = await ForumPost.findByPk(Number(req.params.id));
-    if (!post || post.status === 'hidden') {
+    if (!post || post.status !== 'published') {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
     return res.json({ success: true, data: (await serializePosts([post]))[0] });
@@ -349,7 +386,7 @@ router.post('/:id/view', requireAuth, async (req: AuthedRequest, res: Response) 
   try {
     const postId = Number(req.params.id);
     const post = await ForumPost.findByPk(postId);
-    if (!post || post.status === 'hidden') {
+    if (!post || post.status !== 'published') {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
 
@@ -382,16 +419,39 @@ router.patch('/:id', requireAuth, requireAdmin, upload.single('media'), async (r
     if (!post) {
       return res.status(404).json({ success: false, message: 'Post not found' });
     }
-    const { status, title, body, is_pinned } = req.body;
-    if (status && !['published', 'hidden'].includes(status)) {
+    const { status, title, body, is_pinned, scheduled_for } = req.body;
+    if (status && !['published', 'hidden', 'scheduled'].includes(status)) {
       return res.status(400).json({ success: false, message: 'Invalid status' });
     }
     if (title !== undefined && plainTextLength(String(title)) > 500) {
       return res.status(400).json({ success: false, message: 'Title is too long (max 500 characters)' });
     }
 
+    // Reschedule an existing scheduled post — same future-date validation as
+    // creating one. Only meaningful alongside status:'scheduled' (or the
+    // post's current status already being 'scheduled'), but harmless to
+    // accept either way; the poller only ever looks at scheduled rows.
+    let scheduledDate: Date | null | undefined; // undefined = not touched by this request
+    if (scheduled_for !== undefined) {
+      if (scheduled_for === null || scheduled_for === '') {
+        scheduledDate = null;
+      } else {
+        const parsed = parseIstWallClock(String(scheduled_for));
+        if (!parsed || parsed.getTime() <= Date.now()) {
+          return res.status(400).json({ success: false, message: 'scheduled_for must be a valid future date/time' });
+        }
+        scheduledDate = parsed;
+      }
+    }
+
+    // "Publish now" — manually skip the wait on a still-scheduled post.
+    // Detected before `updates` touches status, so it still sees the
+    // pre-update value.
+    const publishingScheduledNow = status === 'published' && post.status === 'scheduled';
+
     const updates: Partial<ForumPost> = {};
     if (status) updates.status = status;
+    if (scheduledDate !== undefined) updates.scheduled_for = scheduledDate;
     if (title !== undefined) updates.title = sanitizeForumTitle(String(title));
     if (body !== undefined) updates.body = sanitizeForumBody(String(body));
 
@@ -436,9 +496,15 @@ router.patch('/:id', requireAuth, requireAdmin, upload.single('media'), async (r
       }
     }
 
-    const serialized = (await serializePosts([post]))[0];
-    if ('is_pinned' in updates) {
-      const io = req.app.get('io');
+    // Manually publishing a scheduled post early runs the exact same
+    // "going live" side-effects the poller would have run at its scheduled
+    // time — broadcast, notification fan-out, push. Otherwise, a plain edit
+    // (or hide/pin toggle) just re-broadcasts the updated post as before.
+    const io = req.app.get('io');
+    const serialized = publishingScheduledNow
+      ? await publishPost(io, post, req.identity!.id)
+      : (await serializePosts([post]))[0];
+    if (!publishingScheduledNow && 'is_pinned' in updates) {
       io.to('feed').emit('post:updated', serialized);
     }
 

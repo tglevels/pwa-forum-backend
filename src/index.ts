@@ -72,6 +72,23 @@ async function ensureViolationTypeEnum() {
   }
 }
 
+// forum_posts predates the 'scheduled' status and scheduled_for column —
+// widen the enum and add the column by hand, additive-only (existing
+// published/hidden rows are untouched).
+async function ensureForumPostScheduleColumns() {
+  const qi = sequelize.getQueryInterface();
+  const columns = await qi.describeTable('forum_posts');
+  if (columns.status && !String(columns.status.type).includes('scheduled')) {
+    await qi.changeColumn('forum_posts', 'status', {
+      type: DataTypes.ENUM('published', 'hidden', 'scheduled'),
+      defaultValue: 'published',
+    });
+  }
+  if (!columns.scheduled_for) {
+    await qi.addColumn('forum_posts', 'scheduled_for', { type: DataTypes.DATE, allowNull: true });
+  }
+}
+
 // Seed the two pinned system tabs once, idempotently. 'trending' never
 // collects forum_post_tabs rows (its feed stays the computed ranking in
 // posts.ts) — the row only exists so GET /tabs can list it in the bar.
@@ -173,6 +190,7 @@ import notificationsRoutes from './routes/notifications';
 import usersRoutes from './routes/users';
 import tabsRoutes from './routes/tabs';
 import analyticsRoutes from './routes/analytics';
+import internalRoutes from './routes/internal';
 
 app.use('/api/v1/forum/posts', postsRoutes);
 app.use('/api/v1/forum/votes', votesRoutes);
@@ -180,6 +198,7 @@ app.use('/api/v1/forum/notifications', notificationsRoutes);
 app.use('/api/v1/forum/users', usersRoutes);
 app.use('/api/v1/forum/tabs', tabsRoutes);
 app.use('/api/v1/forum/analytics', analyticsRoutes);
+app.use('/api/v1/forum/internal', internalRoutes);
 
 const PORT = process.env.PORT || 3005;
 
@@ -195,6 +214,7 @@ async function startServer() {
     void ForumUserAccount;
     await Promise.all([ForumPost.sync()]);
     await ensureForumPostMediaColumns();
+    await ensureForumPostScheduleColumns();
     await Promise.all([ForumComment.sync(), ForumVote.sync(), ForumPostView.sync(), ForumNotification.sync()]);
     // After ForumComment (it has an FK reference to forum_comments).
     await ForumViolation.sync();

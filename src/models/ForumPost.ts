@@ -7,7 +7,11 @@ export class ForumPost extends Model {
   declare community_id: string | null;
   declare title: string;
   declare body: string;
-  declare status: 'published' | 'hidden';
+  declare status: 'published' | 'hidden' | 'scheduled';
+  // Only set for status='scheduled' — when the scheduler in index.ts should
+  // flip this post live. Left in place (not nulled) after publishing, as a
+  // harmless record of when it was originally scheduled for.
+  declare scheduled_for: Date | null;
   declare vote_count: number;
   declare comment_count: number;
   declare view_count: number;
@@ -27,7 +31,8 @@ ForumPost.init(
     community_id: { type: DataTypes.STRING, allowNull: true },
     title: { type: DataTypes.STRING, allowNull: false },
     body: { type: DataTypes.TEXT, allowNull: false },
-    status: { type: DataTypes.ENUM('published', 'hidden'), defaultValue: 'published' },
+    status: { type: DataTypes.ENUM('published', 'hidden', 'scheduled'), defaultValue: 'published' },
+    scheduled_for: { type: DataTypes.DATE, allowNull: true },
     vote_count: { type: DataTypes.INTEGER, defaultValue: 0 },
     comment_count: { type: DataTypes.INTEGER, defaultValue: 0 },
     view_count: { type: DataTypes.INTEGER, defaultValue: 0 },
